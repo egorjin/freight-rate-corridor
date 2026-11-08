@@ -8,7 +8,7 @@
 
 Данные лежат в PostgreSQL 17. Правила очистки и модель написаны на Python: их удобно закрыть pytest. Карточка маршрута — один SQL-запрос. Квартили, MoM и YoY в датафрейме проще испортить, а на 300 тысячах строк второй движок не нужен.
 
-Airflow, Superset и ClickHouse — задачи со звёздочкой. Цифры от них не меняются, поэтому я их не ставил. Оркестратор здесь — `docker-compose up`.
+Airflow, Superset и ClickHouse вынесены в профиль `bonus`. Они публикуют ту же витрину, поэтому цифры не меняются. `docker-compose up` по-прежнему поднимает только Postgres и один прогон пайплайна.
 
 В `mart.ml_price_predictions` пишется CatBoost. Рядом, на том же разбиении, обучается неглубокое дерево, и его метрики ложатся в `mart.ml_run_metrics`. Нужна была простая точка сравнения.
 
@@ -33,6 +33,7 @@ flowchart LR
 | `etl/` | DQ, дедуп городов, идемпотентная загрузка, пересчёт витрины |
 | `ml/` | Признаки, временное разбиение, обучение, пакетный скоринг |
 | `pipeline.py` | Одна точка входа на все три этапа |
+| `dags/`, `sql/clickhouse/`, `docker/airflow/`, `docker/superset/` | Профиль `bonus`: DAG Airflow, копия в ClickHouse, дашборд Superset |
 | `tests/` | Правила, разбиение, утечки, по желанию повторный прогон в БД |
 
 ## Запуск
@@ -46,7 +47,7 @@ docker-compose up --build
 Когда контейнер пайплайна завершается, Postgres остаётся поднят. С хоста:
 
 ```bash
-psql -h localhost -U postgres -d deals_bigdata
+psql -h localhost -p 5433 -U postgres -d deals_bigdata
 ```
 
 Пароль `postgres` (только локальный контейнер, см. `.env.example`). В Python пароль не зашит.
@@ -87,6 +88,51 @@ docker-compose up --build
 ```
 
 `N_PRICES` читается только при первой инициализации. Потом его смена ничего не делает, пока не удалён том.
+
+## Профиль bonus
+
+Airflow, Superset и ClickHouse — задачи со звёздочкой. `docker-compose up` их не поднимает.
+
+```bash
+docker-compose --profile bonus up --build clickhouse clickhouse-sync bonus-db airflow superset
+```
+
+Сервисы нужно назвать явно. Голый `--profile bonus up` заодно стартует `pipeline`, и CatBoost обучается ещё раз. Команда выше пайплайн не трогает и берёт витрину, которая уже лежит в Postgres. На пустом томе сначала `docker-compose up --build` и дождаться, пока контейнер пайплайна завершится.
+
+Эти процессы ходят в Postgres из Compose, не в Supabase. `POSTGRES_PASSWORD` должен быть тем паролем, с которым создавался том.
+
+| Сервис | Адрес | Локальный вход |
+| --- | --- | --- |
+| Airflow | http://localhost:8080 | `admin` / `admin` |
+| Superset | http://localhost:8088 | `admin` / `admin`, дашборд `route-card` |
+| ClickHouse | http://localhost:8123 | пользователь `default`, пароль `corridor` |
+
+DAG `freight_rate_corridor` создаётся на паузе. Снимите паузу, когда нужен следующий пересчёт. Четыре задачи: `etl`, затем `route_card`, затем вместе `score` и `clickhouse`. `score` — тот же прогон CatBoost, что и `pipeline.py`. `clickhouse` копирует `mart.route_card` в `ReplacingMergeTree` с тем же ключом, что и первичный ключ карточки. Повторный прогон вставляет строки снова; `OPTIMIZE ... FINAL` оставляет одну строку на ячейку. Копия сверяет `count(*)` и `sum(trips_count)` с Postgres и падает, если они разошлись.
+
+Superset читает эту витрину в Postgres. На дашборде метрики модели, медиана Москва → Ростов-на-Дону, тент, FTL, и помесячные строки под ней.
+
+```mermaid
+flowchart LR
+    AF["Airflow DAG\nfreight_rate_corridor"] --> PG["PostgreSQL\nmart.route_card"]
+    PG --> CH["ClickHouse\nReplacingMergeTree"]
+    PG --> SS["Superset\nroute-card"]
+```
+
+Та же полоса в ClickHouse после копирования:
+
+```bash
+docker compose exec clickhouse clickhouse-client --password corridor --query "
+SELECT price_month, trips_count, median_trip
+FROM mart.route_card FINAL
+WHERE loading_city_gcid = 1001
+  AND unloading_city_gcid = 1008
+  AND body_group = 'Тент'
+  AND weight_category = 'FTL'
+ORDER BY price_month
+"
+```
+
+Логины и ключ Fernet выше — локальные значения по умолчанию из `docker-compose.yml`. Их можно переопределить через `.env.example`.
 
 ## Очистка
 
@@ -242,5 +288,4 @@ limit 20;
 
 - Второго детектора выбросов нет. Фильтр — переданный флаг.
 - Курса по дате погрузки нет.
-- DAG в Airflow нет. Повторный прогон — `pipeline.py --start --end`.
 - Аукционные строки чистятся в core и не попадают ни в карточку, ни в модель.

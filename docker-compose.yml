@@ -2,12 +2,12 @@ services:
   postgres:
     image: postgres:17
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+      POSTGRES_USER: ${LOCAL_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${LOCAL_POSTGRES_DB:-deals_bigdata}
       N_PRICES: ${N_PRICES:-300000}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PUBLISH_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./assignment/sql/schema.sql:/sql/schema.sql:ro
@@ -32,14 +32,155 @@ services:
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+      POSTGRES_USER: ${LOCAL_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${LOCAL_POSTGRES_DB:-deals_bigdata}
       AS_OF_DATE: ${AS_OF_DATE:-2026-10-26}
       ETL_START_DATE: ${ETL_START_DATE:-2019-01-01}
       ETL_END_DATE: ${ETL_END_DATE:-2027-12-31}
       RANDOM_SEED: ${RANDOM_SEED:-42}
     command: ["python", "pipeline.py"]
 
+  # Bonus profile. `docker compose up` does not start these.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12
+    profiles: ["bonus"]
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-corridor}
+      CLICKHOUSE_DB: mart
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    volumes:
+      - chdata:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  bonus-db:
+    image: postgres:17
+    profiles: ["bonus"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${LOCAL_POSTGRES_USER:-postgres}
+      PGPASSWORD: ${LOCAL_POSTGRES_PASSWORD:-postgres}
+      PGDATABASE: postgres
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -eu
+        for name in airflow superset; do
+          exists=$$(psql -tAc "SELECT 1 FROM pg_database WHERE datname = '$${name}'")
+          if [ "$$exists" != "1" ]; then
+            psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${name}\""
+          fi
+        done
+    restart: "no"
+
+  clickhouse-sync:
+    profiles: ["bonus"]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${LOCAL_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${LOCAL_POSTGRES_DB:-deals_bigdata}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-corridor}
+      CLICKHOUSE_DB: mart
+    command: ["python", "-m", "etl.sync_clickhouse"]
+    restart: "no"
+
+  airflow:
+    profiles: ["bonus"]
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    depends_on:
+      bonus-db:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${LOCAL_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${LOCAL_POSTGRES_DB:-deals_bigdata}
+      AS_OF_DATE: ${AS_OF_DATE:-2026-10-26}
+      ETL_START_DATE: ${ETL_START_DATE:-2019-01-01}
+      ETL_END_DATE: ${ETL_END_DATE:-2027-12-31}
+      RANDOM_SEED: ${RANDOM_SEED:-42}
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-bG9jYWx0Y29ycmlkb3ItZmVybmV0LWtleS0zMmJ5dGU=}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      PYTHONPATH: /opt/airflow/project
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./pipeline.py:/opt/airflow/project/pipeline.py
+      - ./etl:/opt/airflow/project/etl
+      - ./ml:/opt/airflow/project/ml
+      - ./sql:/opt/airflow/project/sql
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+
+  superset:
+    profiles: ["bonus"]
+    build:
+      context: .
+      dockerfile: docker/superset/Dockerfile
+    depends_on:
+      bonus-db:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${LOCAL_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${LOCAL_POSTGRES_DB:-deals_bigdata}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER:-admin}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-local-corridor-superset-secret}
+    ports:
+      - "${SUPERSET_PORT:-8088}:8088"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 90s
+
 volumes:
   pgdata:
+  chdata:

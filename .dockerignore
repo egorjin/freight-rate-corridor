@@ -1,0 +1,7 @@
+.venv
+.git
+ml/artifacts
+__pycache__
+.pytest_cache
+.env
+assignment/attachments/supabase.sh

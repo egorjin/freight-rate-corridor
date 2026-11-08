@@ -8,7 +8,7 @@ Take-home for the Smart Logistics rate desk. Closed deals go in. A monthly route
 
 PostgreSQL 17 holds the data. Python does the cleaning rules and the model, because those are the parts I want under pytest. The route card is one SQL statement: quartiles, MoM and YoY are much harder to get wrong in SQL than in a dataframe, and 300k rows do not need a second engine.
 
-Airflow, Superset and ClickHouse are the bonus track. They would not change a single number, so I left them out. `docker-compose up` is the scheduler.
+Airflow, Superset and ClickHouse sit on the bonus profile. They republish the same mart, so the numbers do not move. `docker-compose up` is still Postgres and one pipeline run.
 
 CatBoost is the model that gets written to `mart.ml_price_predictions`. A shallow decision tree is fit on the same split and stored next to it in `mart.ml_run_metrics`, so there is something boring to compare against.
 
@@ -33,6 +33,7 @@ flowchart LR
 | `etl/` | DQ, city dedup, idempotent load, mart refresh |
 | `ml/` | Features, time split, train, batch score |
 | `pipeline.py` | One entrypoint for all three stages |
+| `dags/`, `sql/clickhouse/`, `docker/airflow/`, `docker/superset/` | Bonus profile: Airflow DAG, ClickHouse copy, Superset dashboard |
 | `tests/` | Rules, split, leakage, optional DB rerun |
 
 ## Run
@@ -46,7 +47,7 @@ On an empty volume Postgres loads the schema and the synthetic generator (300 00
 When the pipeline container exits, Postgres stays up. From the host:
 
 ```bash
-psql -h localhost -U postgres -d deals_bigdata
+psql -h localhost -p 5433 -U postgres -d deals_bigdata
 ```
 
 Password is `postgres` (local container only, see `.env.example`). Nothing in the Python code has a password baked in.
@@ -87,6 +88,51 @@ docker-compose up --build
 ```
 
 `N_PRICES` is read only on the first init. Changing it later does nothing until the volume is removed.
+
+## Bonus profile
+
+Airflow, Superset and ClickHouse are the starred track. `docker-compose up` does not start them.
+
+```bash
+docker-compose --profile bonus up --build clickhouse clickhouse-sync bonus-db airflow superset
+```
+
+Name the services. A bare `--profile bonus up` also starts `pipeline`, and that trains CatBoost again. The command above leaves the pipeline container alone and uses the mart already in Postgres. On a brand-new volume, run `docker-compose up --build` first and wait until the pipeline container exits.
+
+These processes talk to the Compose Postgres, not to Supabase. `POSTGRES_PASSWORD` has to be the password that volume was created with.
+
+| Service | URL | Local login |
+| --- | --- | --- |
+| Airflow | http://localhost:8080 | `admin` / `admin` |
+| Superset | http://localhost:8088 | `admin` / `admin`, dashboard `route-card` |
+| ClickHouse | http://localhost:8123 | user `default`, password `corridor` |
+
+The DAG `freight_rate_corridor` is paused on creation. Unpause it for the next rebuild. Four tasks: `etl`, then `route_card`, then `score` and `clickhouse` together. `score` is the same CatBoost job as `pipeline.py`. `clickhouse` copies `mart.route_card` into a `ReplacingMergeTree` ordered by the card's primary key. A second run inserts again; `OPTIMIZE ... FINAL` leaves one row per cell. The copy checks `count(*)` and `sum(trips_count)` against Postgres and exits if they differ.
+
+Superset reads that Postgres mart. The dashboard has the model metrics, the Moscow → Rostov-on-Don tent FTL median, and the monthly rows behind it.
+
+```mermaid
+flowchart LR
+    AF["Airflow DAG\nfreight_rate_corridor"] --> PG["PostgreSQL\nmart.route_card"]
+    PG --> CH["ClickHouse\nReplacingMergeTree"]
+    PG --> SS["Superset\nroute-card"]
+```
+
+After the copy, the same lane in ClickHouse:
+
+```bash
+docker compose exec clickhouse clickhouse-client --password corridor --query "
+SELECT price_month, trips_count, median_trip
+FROM mart.route_card FINAL
+WHERE loading_city_gcid = 1001
+  AND unloading_city_gcid = 1008
+  AND body_group = 'Тент'
+  AND weight_category = 'FTL'
+ORDER BY price_month
+"
+```
+
+Logins and the Fernet key above are the local defaults in `docker-compose.yml`. Override them from `.env.example`.
 
 ## Cleaning
 
@@ -242,5 +288,4 @@ limit 20;
 
 - No second outlier detector. The supplied flag is the filter.
 - No FX lookup by loading date.
-- No Airflow DAG. Rerun with `pipeline.py --start --end`.
 - Auction rows are cleaned into core and kept out of the card and the model.

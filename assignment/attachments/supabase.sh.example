@@ -1,0 +1,20 @@
+postgresql://postgres.<project-ref>:<password>@<session-host>:5432/postgres
+
+psql "postgresql://postgres.<project-ref>:<password>@<session-host>:5432/postgres" \
+  -v ON_ERROR_STOP=1 \
+  -c "set statement_timeout = '10min'" \
+  -f assignment/sql/schema.sql
+
+psql "postgresql://postgres.<project-ref>:<password>@<session-host>:5432/postgres" \
+  -v ON_ERROR_STOP=1 \
+  -c "set statement_timeout = '10min'" \
+  -v n_prices=300000 \
+  -f assignment/sql/synthetic.sql
+
+POSTGRES_HOST=<session-host> POSTGRES_PORT=5432 \
+POSTGRES_DB=postgres POSTGRES_USER=postgres.<project-ref> \
+POSTGRES_PASSWORD="<password>" \
+.venv/bin/python pipeline.py --skip-wait
+
+psql "postgresql://postgres.<project-ref>:<password>@<session-host>:5432/postgres" \
+  -c "select count(*) from mart.route_card;"
