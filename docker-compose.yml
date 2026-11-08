@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+      N_PRICES: ${N_PRICES:-300000}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./assignment/sql/schema.sql:/sql/schema.sql:ro
+      - ./assignment/sql/synthetic.sql:/sql/synthetic.sql:ro
+      - ./docker/init-source.sh:/docker-entrypoint-initdb.d/01-init-source.sh:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB && PGPASSWORD=$$POSTGRES_PASSWORD psql -U $$POSTGRES_USER -d $$POSTGRES_DB -tAc 'select 1 from public.source_ready' | grep -q 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 120
+      start_period: 60s
+
+  pipeline:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+      AS_OF_DATE: ${AS_OF_DATE:-2026-10-26}
+      ETL_START_DATE: ${ETL_START_DATE:-2019-01-01}
+      ETL_END_DATE: ${ETL_END_DATE:-2027-12-31}
+      RANDOM_SEED: ${RANDOM_SEED:-42}
+    command: ["python", "pipeline.py"]
+
+volumes:
+  pgdata:
