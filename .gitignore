@@ -1,4 +1,5 @@
 .env
+assignment/attachments/supabase.sh
 .venv/
 __pycache__/
 .pytest_cache/
